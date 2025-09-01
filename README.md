@@ -82,7 +82,7 @@ Or from a cloned repo:
 
 - Installs `codexcondom` to `~/.local/bin` under your home (or `/root` if run as root)
 - Copies runtime Containerfile into `~/.local/share/codexcondoms/`
-- Ensures `~/.local/bin` is on PATH (automatically for the one-liner; prompts when interactive)
+- Prompts to add `~/.local/bin` to PATH when interactive; warns otherwise if missing
 
 ## Security Note
 

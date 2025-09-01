@@ -6,6 +6,7 @@ set -euo pipefail
 
 die() { echo "[ERROR] $*" >&2; exit 1; }
 info() { echo "[INFO] $*" >&2; }
+warn() { echo "[WARN] $*" >&2; }
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT="$SCRIPT_DIR"
@@ -138,8 +139,8 @@ main() {
         *) add_path=0 ;;
       esac
     else
-      # Non-interactive (e.g., curl|bash): update PATH automatically
-      add_path=1
+      # Non-interactive: warn but do not modify PATH
+      warn "$TARGET_BIN_DIR is not in PATH. Add it to use codexcondom."
     fi
   else
     add_path=0
