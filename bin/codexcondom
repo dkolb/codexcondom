@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Codex Condoms launcher
+#
+# Simplified single-command interface. Creates a deterministic, per-workspace
+# Podman environment and launches either codex (default) or an interactive bash
+# shell inside it.
+#
+# Debugging:
+#   Set CODEX_CONDOM_DEBUG=1 to enable bash xtrace and unsuppressed podman output.
+
+if [[ "${CODEX_CONDOM_DEBUG:-0}" == "1" ]]; then
+  set -x
+fi
+
+usage() {
+  local me
+  me=$(basename "$0")
+  cat <<USAGE
+Codex Condoms — per-workspace Podman environment
+
+Usage:
+  ${me} [/path/to/workspace] [options]
+
+Options:
+  --image IMG           Base Fedora image for build (default: registry.fedoraproject.org/fedora:latest)
+  --name NAME           Explicit environment name (otherwise derived from workspace path)
+  --recreate-container  Recreate the environment (no image rebuild)
+  --recreate-homedir    Also wipe and recreate the environment home dir
+  --rebuild-image       Rebuild the cached image without cache
+  --total-rebuild       Equivalent to --rebuild-image --recreate-container --recreate-homedir
+  --no-mask-host-home   Do not mask host home inside container (default: masked)
+  --bash                Start a bash shell instead of codex
+  -h, --help            Show this help
+USAGE
+}
+
+die() { echo "[ERROR] $*" >&2; exit 1; }
+info() { echo "[INFO] $*" >&2; }
+
+command -v podman >/dev/null 2>&1 || die "podman is required. See https://podman.io/"
+
+# Thin wrapper around podman for debug verbosity (suppresses stderr unless debug).
+pm() {
+  if [[ "${CODEX_CONDOM_DEBUG:-0}" == "1" ]]; then
+    command podman "$@"
+  else
+    command podman "$@" 2>/dev/null
+  fi
+}
+
+WORKSPACE=""
+IMAGE="registry.fedoraproject.org/fedora:latest"
+EXPLICIT_NAME=""
+RECREATE_CONTAINER=0
+RECREATE_HOMEDIR=0
+REBUILD_IMAGE=0
+MASK_HOST_HOME=1
+PUT_ON_BASH=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --image) IMAGE="${2:?missing image}"; shift 2 ;;
+    --name) EXPLICIT_NAME="${2:?missing name}"; shift 2 ;;
+    --recreate-container) RECREATE_CONTAINER=1; shift ;;
+    --recreate-homedir) RECREATE_HOMEDIR=1; RECREATE_CONTAINER=1; shift ;;
+    --rebuild-image) REBUILD_IMAGE=1; shift ;;
+    --total-rebuild) REBUILD_IMAGE=1; RECREATE_CONTAINER=1; RECREATE_HOMEDIR=1; shift ;;
+    --no-mask-host-home) MASK_HOST_HOME=0; shift ;;
+    --bash) PUT_ON_BASH=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) die "Unknown option: $1" ;;
+    *)
+      if [[ -z "$WORKSPACE" ]]; then
+        WORKSPACE="$1"; shift ;
+      else
+        die "Unexpected extra argument: $1" ;
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "$WORKSPACE" ]]; then
+  WORKSPACE="$(pwd)"
+fi
+
+HOST_HOME=${HOME}
+
+# Resolve absolute path
+WORKSPACE=$(readlink -f "$WORKSPACE")
+[[ -d "$WORKSPACE" ]] || die "Workspace directory does not exist: $WORKSPACE"
+
+# Derive a deterministic, safe name from workspace path if not provided
+slugify() {
+  local s="$1"
+  s=$(echo -n "$s" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-+/-/g')
+  echo -n "$s"
+}
+
+short_hash() {
+  if command -v sha1sum >/dev/null 2>&1; then
+    echo -n "$1" | sha1sum | awk '{print $1}' | cut -c1-8
+  else
+    echo -n "$1" | shasum | awk '{print $1}' | cut -c1-8
+  fi
+}
+
+WS_BASENAME=$(basename "$WORKSPACE")
+WS_SLUG=$(slugify "$WS_BASENAME")
+WS_HASH=$(short_hash "$WORKSPACE")
+CONTAINER_NAME=${EXPLICIT_NAME:-"codex-condom-${WS_SLUG}-${WS_HASH}"}
+
+# Unique home paths (host and container)
+CONTAINER_HOME_HOST="${HOST_HOME}/codex_condoms/${WS_SLUG}-${WS_HASH}"
+CONTAINER_HOME="/home/codex"
+WORKSPACE_MOUNT_TARGET="${CONTAINER_HOME}/workspace"
+CODEX_SRC="${HOST_HOME}/.codex"
+CODEX_DST="${CONTAINER_HOME}/.codex"
+
+build_volumes() {
+  VOLUMES=("${CONTAINER_HOME_HOST}:${CONTAINER_HOME}:z" "${WORKSPACE}:${WORKSPACE_MOUNT_TARGET}:rw,z")
+  # Always ensure host ~/.codex exists and mount read-write for proper Codex auth/config behavior
+  mkdir -p "$CODEX_SRC"
+  VOLUMES+=("${CODEX_SRC}:${CODEX_DST}:z")
+}
+
+RUNTIME_IMAGE_TAG="localhost/codex:latest"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+IMAGES_DIR="$DATA_HOME/codexcondoms/images"
+CONTAINERFILE_PATH="$IMAGES_DIR/codex.Containerfile"
+
+ensure_containerfile() {
+  if [[ ! -f "$CONTAINERFILE_PATH" ]]; then
+    die "Missing Containerfile at $CONTAINERFILE_PATH. Re-run install.sh to refresh resources."
+  fi
+}
+
+image_exists() { pm image exists "$RUNTIME_IMAGE_TAG"; }
+
+build_or_rebuild_image() {
+  ensure_containerfile
+  local NO_CACHE_ARGS=()
+  local uid gid
+  uid=$(id -u)
+  gid=$(id -g)
+  if [[ $REBUILD_IMAGE -eq 1 ]]; then
+    NO_CACHE_ARGS+=(--no-cache)
+  fi
+  info "Building cached image: $RUNTIME_IMAGE_TAG (base: $IMAGE, uid=$uid gid=$gid)${NO_CACHE_ARGS:+ [no-cache]}"
+  pm build -t "$RUNTIME_IMAGE_TAG" -f "$CONTAINERFILE_PATH" \
+    --build-arg FEDORA_BASE="$IMAGE" \
+    --build-arg UID="$uid" \
+    --build-arg GID="$gid" \
+    "${NO_CACHE_ARGS[@]}" \
+    "$IMAGES_DIR"
+}
+
+ensure_image() {
+  if [[ $REBUILD_IMAGE -eq 1 ]]; then
+    build_or_rebuild_image
+    return
+  fi
+  if ! image_exists; then
+    build_or_rebuild_image
+  fi
+}
+
+container_exists() { pm container exists "$CONTAINER_NAME"; }
+
+create_or_recreate_container() {
+  if container_exists && [[ $RECREATE_CONTAINER -eq 1 ]]; then
+    info "Removing existing container: $CONTAINER_NAME"
+    pm rm -f "$CONTAINER_NAME" || true
+  fi
+  if [[ -d "$CONTAINER_HOME_HOST" ]] && [[ $RECREATE_HOMEDIR -eq 1 ]]; then
+    local prefix="$HOST_HOME/codex_condoms/"
+    case "$CONTAINER_HOME_HOST/" in
+      "$prefix"*)
+        info "Removing environment home: $CONTAINER_HOME_HOST"
+        rm -rf -- "$CONTAINER_HOME_HOST"
+        ;;
+      *)
+        die "Refusing to remove unexpected home path: $CONTAINER_HOME_HOST"
+        ;;
+    esac
+  fi
+
+  mkdir -p "$CONTAINER_HOME_HOST" "$CONTAINER_HOME_HOST/workspace"
+  if [[ -d "$CODEX_SRC" ]]; then
+    mkdir -p "$CONTAINER_HOME_HOST/.codex"
+  fi
+
+  ensure_image
+  info "Environment ready: $CONTAINER_NAME (image: $RUNTIME_IMAGE_TAG)"
+}
+
+launch() {
+  create_or_recreate_container
+  CREATE_ARGS=(--name "$CONTAINER_NAME" --replace --rm --userns=keep-id)
+  CREATE_ARGS+=(--env HOME="$CONTAINER_HOME")
+  CREATE_ARGS+=(--env CODEX_CONTAINER_NAME="$CONTAINER_NAME")
+  CREATE_ARGS+=(--env CODEX_WORKSPACE_DIR="$WORKSPACE_MOUNT_TARGET")
+  CREATE_ARGS+=(--env CODEX_HOME="$CONTAINER_HOME/.codex")
+  if pm run --help 2>/dev/null | grep -q -- "--group-add"; then
+    local gids host_gids g
+    host_gids=$(id -G 2>/dev/null || true)
+    gids="${host_gids}"
+    for g in $gids; do
+      [[ -n "$g" ]] && CREATE_ARGS+=(--group-add "$g")
+    done
+  fi
+  if [[ $MASK_HOST_HOME -eq 1 ]]; then
+    CREATE_ARGS+=(--tmpfs "/home")
+  fi
+  build_volumes
+  for v in "${VOLUMES[@]}"; do
+    CREATE_ARGS+=(--volume "$v")
+  done
+  local __exec_cmd
+  if [[ $PUT_ON_BASH -eq 1 ]]; then
+    __exec_cmd='exec bash -l'
+  else
+    __exec_cmd='exec codex --cd workspace/'
+  fi
+  exec podman run -it "${CREATE_ARGS[@]}" "$RUNTIME_IMAGE_TAG" \
+    bash -lc "${__exec_cmd}"
+}
+
+launch
